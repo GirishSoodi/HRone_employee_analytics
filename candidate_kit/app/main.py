@@ -5,6 +5,7 @@ Compliant with OpenAPI 3.0.3 Contract v2.0 and Business Rules R1 - R10.
 import calendar
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -26,6 +27,8 @@ from pymongo.collection import Collection, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # MongoDB Connection & Configuration
@@ -91,9 +94,9 @@ def create_indexes():
                 "salt": s,
                 "created_at": datetime.now(timezone.utc),
             })
-    except Exception as e:
-        # Do not crash startup if MongoDB is momentarily unreachable (e.g. before initial ping in tests)
-        pass
+    except PyMongoError:
+        # Keep startup available for health checks, but never hide index failures.
+        logger.exception("MongoDB index initialization failed; check database connectivity and indexes.")
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
@@ -837,17 +840,49 @@ def employee_monthly(emp_code: str = Path(...), month: str = Query(..., pattern=
     first_day = f"{month}-01"
     last_day = f"{month}-{num_days:02d}"
 
-    # Calculate working_days (Mon-Fri) per R7
-    joined_on = emp["joined_on"]
-    working_days = 0
-    if joined_on <= last_day:
-        start_date = max(dt_date.fromisoformat(first_day), dt_date.fromisoformat(joined_on))
-        end_date = dt_date.fromisoformat(last_day)
-        cur = start_date
-        while cur <= end_date:
-            if cur.weekday() < 5:  # Mon=0, Fri=4
-                working_days += 1
-            cur += timedelta(days=1)
+    # Calculate working_days (Mon-Fri) in MongoDB aggregation (R7).
+    working_days_result = list(db.employees.aggregate([
+        {"$match": {"emp_code": emp_code}},
+        {"$project": {
+            "joined_date": {"$dateFromString": {"dateString": "$joined_on"}},
+            "month_start": {"$dateFromString": {"dateString": first_day}},
+            "month_end": {"$dateFromString": {"dateString": last_day}},
+        }},
+        {"$project": {
+            "start_date": {"$cond": [
+                {"$gt": ["$joined_date", "$month_start"]},
+                "$joined_date",
+                "$month_start",
+            ]},
+            "joined_date": 1,
+            "month_end": 1,
+        }},
+        {"$project": {
+            "working_dates": {"$cond": [
+                {"$lte": ["$joined_date", "$month_end"]},
+                {"$map": {
+                    "input": {"$range": [
+                        0,
+                        {"$add": [
+                            {"$dateDiff": {"startDate": "$start_date", "endDate": "$month_end", "unit": "day"}},
+                            1,
+                        ]},
+                    ]},
+                    "as": "offset",
+                    "in": {"$dateAdd": {"startDate": "$start_date", "unit": "day", "amount": "$$offset"}},
+                }},
+                [],
+            ]},
+        }},
+        {"$project": {
+            "working_days": {"$size": {"$filter": {
+                "input": "$working_dates",
+                "as": "day",
+                "cond": {"$in": [{"$dayOfWeek": "$$day"}, [2, 3, 4, 5, 6]]},
+            }}},
+        }},
+    ]))
+    working_days = int(working_days_result[0]["working_days"]) if working_days_result else 0
 
     pipeline = [
         {"$match": {
